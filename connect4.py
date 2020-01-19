@@ -3,6 +3,25 @@ import pygame
 import math
 import sys
 import random
+import serial
+import tensorflow.keras
+from PIL import Image, ImageOps
+import cv2
+import struct
+import time
+
+startMarker = '<'
+endMarker = '>'
+dataStarted = False
+dataBuf = ""
+messageComplete = False
+
+
+BLUE =(0, 0, 255)
+BLACK = (0, 0, 0)
+RED = (255, 0, 0)
+YELLOW = (255, 255, 0)
+
 
 ROW_COUNT = 6
 COLUMN_COUNT = 7
@@ -15,6 +34,69 @@ PLAYER_PIECE = 1
 AI_PIECE = 2
 
 WINDOW_LENGTH = 4
+
+# Disable scientific notation for clarity
+np.set_printoptions(suppress=True)
+
+# Loading the Keras model
+model = tensorflow.keras.models.load_model('keras_playingcards.h5')
+video = cv2.VideoCapture(0)
+
+
+def setupSerial(baudRate, serialPortName):
+    global serialPort
+
+    serialPort = serial.Serial(port=serialPortName, baudrate=baudRate, timeout=0, rtscts=True)
+
+    print("Serial port " + serialPortName + " opened  Baudrate " + str(baudRate))
+
+    waitForArduino()
+
+def sendToArduino(stringToSend):
+    # this adds the start- and end-markers before sending
+    global startMarker, endMarker, serialPort
+
+    stringWithMarkers = (startMarker)
+    stringWithMarkers += stringToSend
+    stringWithMarkers += (endMarker)
+
+    serialPort.write(stringWithMarkers.encode('utf-8'))  # encode needed for Python3
+
+def recvLikeArduino():
+    global startMarker, endMarker, serialPort, dataStarted, dataBuf, messageComplete
+
+    if serialPort.inWaiting() > 0 and messageComplete == False:
+        x = serialPort.read().decode("utf-8")  # decode needed for Python3
+
+        if dataStarted == True:
+            if x != endMarker:
+                dataBuf = dataBuf + x
+            else:
+                dataStarted = False
+                messageComplete = True
+        elif x == startMarker:
+            dataBuf = ''
+            dataStarted = True
+
+    if (messageComplete == True):
+        messageComplete = False
+        return dataBuf
+    else:
+        return "XXX"
+
+
+def waitForArduino():
+    # wait until the Arduino sends 'Arduino is ready' - allows time for Arduino reset
+    # it also ensures that any bytes left over from a previous message are discarded
+
+    print("Waiting for Arduino to reset")
+
+    msg = ""
+    while msg.find("Arduino is ready") == -1:
+        msg = recvLikeArduino()
+        if not (msg == 'XXX'):
+            print(msg)
+
 
 def create_board():
     board = np.zeros((ROW_COUNT, COLUMN_COUNT))
@@ -77,7 +159,6 @@ def evaluate_window(window, piece):
         score += 10
     elif window.count(piece) == 2 and window.count(EMPTY) == 2:
         score += 5
-
     if window.count(opp_piece) ==3 and window.count(EMPTY) == 1:
         score -= 80
 
@@ -193,7 +274,29 @@ def pick_best_move(board, piece):
 
     return best_col
 
+def flatten_board(board):
+    flatboard = board.flatten()
+    intboard = flatboard.astype(int)
+    boardlist = str(intboard)
+    boardlist = boardlist.replace(" ", "")
+    boardlist = boardlist.replace("[", "")
+    boardlist = boardlist.replace("]", "")
+    return boardlist
 
+
+def draw_board(board):
+    for c in range(COLUMN_COUNT):
+        for r in range(ROW_COUNT):
+            pygame.draw.rect(screen, BLUE, (c*SQUARESIZE, r*SQUARESIZE+SQUARESIZE, SQUARESIZE, SQUARESIZE))
+            pygame.draw.circle(screen, BLACK, (int(c*SQUARESIZE+SQUARESIZE/2), int(r*SQUARESIZE+SQUARESIZE+SQUARESIZE/2)), RADIUS)
+
+    for c in range(COLUMN_COUNT):
+        for r in range(ROW_COUNT):
+            if board[r][c] == 1:
+                pygame.draw.circle(screen, RED, (int(c * SQUARESIZE + SQUARESIZE / 2), height-int(r * SQUARESIZE + SQUARESIZE / 2)), RADIUS)
+            elif board[r][c] == 2:
+                pygame.draw.circle(screen, YELLOW, (int(c * SQUARESIZE + SQUARESIZE / 2), height-int(r * SQUARESIZE + SQUARESIZE / 2)), RADIUS)
+    pygame.display.update()
 
 board = create_board()
 print_board(board)
@@ -201,31 +304,99 @@ game_over = False
 
 turn = random.randint(PLAYER, AI)
 
+pygame.init()
+
+SQUARESIZE = 100
+
+width = COLUMN_COUNT * SQUARESIZE
+height = (ROW_COUNT+1 )* SQUARESIZE
+
+size = (width, height)
+
+RADIUS = int(SQUARESIZE/2 - 5)
+
+screen = pygame.display.set_mode(size)
+draw_board(board)
+pygame.display.update()
+
+setupSerial(115200, "COM4")
+count = 0
+prevTime = time.time()
 
 while not game_over:
+    _, frame = video.read()
 
-    # Ask for Player 1 Input
+    data = np.ndarray(shape=(1, 224, 224, 3), dtype=np.float32)
+
+    image = Image.fromarray(frame, 'RGB')
+
+    size = (224, 224)
+    image = ImageOps.fit(image, size, Image.ANTIALIAS)
+
+    image_array = np.asarray(image)
+
+    normalized_image_array = (image_array.astype(np.float32) / 127.0) - 1
+
+    data[0] = normalized_image_array
+
+    prediction = model.predict(data)
+
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            sys.exit()
+
+    #if event.type == pygame.MOUSEBUTTONDOWN:
+    pygame.draw.rect(screen, BLACK, (0, 0, width, SQUARESIZE)) # Clear PyGame upper black bar
+
+        # Ask for Player 1 Input
     if turn == PLAYER and not game_over:
-        col = int(input("Player 1 Make your Selection (0-6):"))
+
+        posx = 350
+
+        if prediction.flat[0] > 0.9:
+            posx = 50
+        elif prediction.flat[1] > 0.9:
+            posx = 150
+        elif prediction.flat[2] > 0.9:
+            posx = 250
+        elif prediction.flat[3] > 0.9:
+            posx = 350
+        elif prediction.flat[4] > 0.9:
+            posx = 450
+        elif prediction.flat[5] > 0.9:
+            posx = 550
+
+        pygame.draw.circle(screen, RED, (posx, int(SQUARESIZE / 2)), RADIUS)
+        pygame.display.update()
+
+        if event.type == pygame.MOUSEBUTTONDOWN:
+
+            col = int(math.floor(posx/SQUARESIZE))
+
+            if is_move_valid(board, col):
+                row = get_next_open_row(board, col)
+                insert_piece(board, row, col, PLAYER_PIECE)
+
+                if winning_move(board, PLAYER_PIECE):
+
+                    print("Player 1 wins!")
+
+                    game_over = True
+
+                turn += 1
+                turn = turn % 2
+
+            print_board(board)
+            draw_board(board)
+            sendToArduino(str(flatten_board(board)))
 
 
-        if is_move_valid(board, col):
-            row = get_next_open_row(board, col)
-            insert_piece(board, row, col, PLAYER_PIECE)
-
-            if winning_move(board, PLAYER_PIECE):
-                print("Player 1 wins!")
-                game_over = True
-
-            turn += 1
-            turn = turn % 2
-
-
-    # Ask for Player 2 Input
+        # Ask for Player 2 Input
     elif turn == AI and not game_over:
 
-        #col = pick_best_move(board, AI_PIECE)
-        col, minimax_score = minimax(board, 6, -math.inf, math.inf, True)
+
+        col, minimax_score = minimax(board, 5, -math.inf, math.inf, True)
 
         if is_move_valid(board, col):
             row = get_next_open_row(board, col)
@@ -233,9 +404,25 @@ while not game_over:
 
             if winning_move(board, AI_PIECE):
                 print("Player 2 wins!")
+
                 game_over = True
 
             turn += 1
             turn = turn % 2
 
-    print_board(board)
+        print_board(board)
+        draw_board(board)
+        sendToArduino(str(flatten_board(board)))
+
+
+    # check for a reply
+    #arduinoReply = recvLikeArduino()
+    #if not (arduinoReply == 'XXX'):
+        # print("Time %s  Reply %s" % (time.time(), arduinoReply))
+
+    # send a message at intervals
+    #if time.time() - prevTime > 1:
+
+       # prevTime = time.time()
+       #count += 1
+
